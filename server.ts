@@ -21,11 +21,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
   PeerId,
+  SessionId,
   Peer,
   RegisterResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
+import { computeSessionId } from "./shared/session.ts";
 import {
   generateSummary,
   getGitBranch,
@@ -136,6 +137,7 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+let mySessionId: SessionId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -152,11 +154,11 @@ const mcp = new Server(
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. To reply, call send_message and pass their from_id value as the to_id argument (the parameter is named "to_id" — NOT "to" or "from_id").
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
+- send_message: Send a message to another instance — pass the target's peer ID as the to_id argument (NOT to or from_id)
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
 
@@ -187,13 +189,13 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance by peer ID. Pass the target's peer ID as `to_id` — the parameter name is `to_id` (NOT `to` or `from_id`). The message will be pushed into their session immediately via channel notification.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description: "The peer ID of the target Claude Code instance (from list_peers). Parameter name is `to_id` — do not use `to` or `from_id`.",
         },
         message: {
           type: "string" as const,
@@ -263,6 +265,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Session: ${p.session_id}`,
+            `Status: ${p.status}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -295,7 +299,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      // Accept legacy param names (`to`, `from_id`, `text`) and normalize.
+      // Forked/long-lived sessions can carry stale parameter names in their
+      // working context; rather than silently failing with "Peer undefined
+      // not found", we normalize and tell the caller their input was legacy
+      // so they can update their mental model.
+      const a = args as Record<string, unknown>;
+      const to_id = (a.to_id ?? a.to ?? a.target_id) as string | undefined;
+      const message = (a.message ?? a.text) as string | undefined;
+      const legacyKeys: string[] = [];
+      if (a.to_id === undefined && a.to !== undefined) legacyKeys.push("to (use to_id)");
+      if (a.to_id === undefined && a.target_id !== undefined) legacyKeys.push("target_id (use to_id)");
+      if (a.message === undefined && a.text !== undefined) legacyKeys.push("text (use message)");
+      if (!to_id || !message) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `send_message requires to_id (target peer ID, NOT \"to\" or \"from_id\") and message. Got keys: ${Object.keys(a).join(", ") || "(none)"}.`,
+          }],
+          isError: true,
+        };
+      }
+      if (legacyKeys.length > 0) {
+        log(`send_message: accepted legacy param(s): ${legacyKeys.join(", ")}`);
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -314,8 +341,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+        const legacyNote = legacyKeys.length > 0
+          ? ` (note: you used legacy parameter ${legacyKeys.join(", ")} — update to to_id/message going forward)`
+          : "";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${legacyNote}` }],
         };
       } catch (e) {
         return {
@@ -539,16 +569,22 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker. session_id is derived deterministically from
+  // (pid, cwd, tty) so a re-register after MCP subprocess restart reuses
+  // the same ephemeral id — cached to_id values held by other peers stay
+  // valid across our disconnect/resume.
+  const sessionId = computeSessionId(process.pid, myCwd, tty);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    session_id: sessionId,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  mySessionId = reg.session_id;
+  log(`Registered as peer ${myId} (session ${mySessionId})`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {
