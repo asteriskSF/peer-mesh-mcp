@@ -244,11 +244,19 @@ const reRegisterPeer = db.prepare(`
   WHERE session_id = ?
 `);
 
-// Resolve a peer by its stable session_id. Used both by handleRegister
+// Resolve a peer by its stable session_id. Used by handleRegister
 // (to detect an existing row to reuse the ephemeral id for) and by
 // handleSendMessage (to resolve "session:<session_id>" to_id forms).
 const selectIdBySessionId = db.prepare(`
   SELECT id FROM peers WHERE session_id = ?
+`);
+
+// Same lookup but also returns pid, for handleRegister's fork-detection
+// check: if the existing row's pid is alive AND different from the new
+// registration's pid, it's a concurrent fork (not a restart) — mint a
+// fresh ephemeral id instead of reusing and aliasing the old session.
+const selectPeerBySessionId = db.prepare(`
+  SELECT id, pid FROM peers WHERE session_id = ?
 `);
 
 const updateLastSeen = db.prepare(`
@@ -348,26 +356,71 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
     // registered under the same pid but a *different* session_id (can
     // happen if the session_id derivation changed between versions, or
     // the OS reused a pid for a new session).
-    const existingBySession = selectIdBySessionId.get(session_id) as { id: string } | null;
-    if (existingBySession) {
-      reRegisterPeer.run(
+    const existing = selectPeerBySessionId.get(session_id) as
+      | { id: string; pid: number }
+      | null;
+    if (existing) {
+      // Fork detection: if the existing row's PID is alive AND different
+      // from this registration's PID, this is a concurrent fork (e.g.
+       // two Claude sessions in the same CWD/TTY reading the same token
+      // file), not a restart. Reusing the ephemeral id would alias the
+      // two sessions — heartbeats, messages, and summary would collide.
+      // Instead, leave the existing row intact and mint a fresh id for
+      // the new fork. If the old PID is dead (or same PID = subprocess
+      // restart), reuse as before — that's the identity-stability fix.
+      let isConcurrentFork = false;
+      if (existing.pid !== body.pid) {
+        try {
+          process.kill(existing.pid, 0);
+          isConcurrentFork = true; // old PID alive + different PID = fork
+        } catch {
+          // Old PID is dead — safe to reuse (restart/resume scenario).
+        }
+      }
+
+      if (!isConcurrentFork) {
+        // Restart/resume: reuse the ephemeral id, refresh mutable fields.
+        reRegisterPeer.run(
+          body.pid,
+          body.cwd,
+          body.git_root,
+          body.tty,
+          body.summary,
+          now,
+          session_id,
+        );
+        // Clear any row that shares this pid but a different session_id
+        // (pid reuse by a different logical session).
+        const staleByPid = db
+          .query("SELECT id FROM peers WHERE pid = ? AND session_id != ?")
+          .all(body.pid, session_id) as { id: string }[];
+        for (const row of staleByPid) {
+          deletePeerWithMessages(row.id);
+        }
+        return { id: existing.id, session_id };
+      }
+      // Concurrent fork: fall through to mint a fresh id. The existing
+      // row stays intact for the original session. The new fork gets its
+      // own ephemeral id but shares the same session_id — the UNIQUE
+      // index would block this, so we need a different approach: the fork
+      // gets a fresh session_id by appending a suffix. This means
+      // session: addressing won't route to the fork, which is correct
+      // (the fork is a distinct session, not the original).
+      // We mint a new id + a suffixed session_id for the fork.
+      const forkSessionId = `${session_id}#fork-${body.pid}`;
+      const forkId = generateId();
+      insertPeer.run(
+        forkId,
+        forkSessionId,
         body.pid,
         body.cwd,
         body.git_root,
         body.tty,
         body.summary,
         now,
-        session_id,
+        now,
       );
-      // Also clear any row that shares this pid but a different session_id
-      // (pid reuse by a different logical session).
-      const staleByPid = db
-        .query("SELECT id FROM peers WHERE pid = ? AND session_id != ?")
-        .all(body.pid, session_id) as { id: string }[];
-      for (const row of staleByPid) {
-        deletePeerWithMessages(row.id);
-      }
-      return { id: existingBySession.id, session_id };
+      return { id: forkId, session_id: forkSessionId };
     }
 
     // No existing session — mint a fresh ephemeral id, but first remove

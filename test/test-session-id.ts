@@ -256,6 +256,59 @@ try {
   );
   console.log();
 
+  // Re-register alice with a fresh live PID (test 4 killed the original
+  // alicePid's sleep process). The fork-detection check in handleRegister
+  // uses process.kill(existing.pid, 0) to distinguish fork from restart,
+  // so alice needs a live PID for test 8 to exercise the fork path.
+  const alicePid2 = spawnDummy();
+  const aliceRestored = await fetchJson<RegisterResp>("/register", {
+    pid: alicePid2,
+    cwd: "/test/alice",
+    git_root: null,
+    tty: "pts/1",
+    summary: "alice-restored",
+    session_id: "alice-sess-001",
+  });
+
+  // --- Test 8: concurrent fork with same session_id gets distinct id ---
+  console.log("[test 8] concurrent fork (same session_id, different live PID) gets distinct ephemeral id");
+  {
+    // Bob is alive at bobPid. Register a "fork" using bob's PID but
+    // alice's session_id. Since bob's PID is alive and different from
+    // alice's, the broker should detect this as a concurrent fork and
+    // mint a fresh ephemeral id + a suffixed session_id, NOT alias alice.
+    const fork = await fetchJson<RegisterResp>("/register", {
+      pid: bobPid,
+      cwd: "/test/alice-fork",
+      git_root: null,
+      tty: "pts/1",
+      summary: "alice-fork",
+      session_id: "alice-sess-001",
+    });
+    assert(fork.id !== aliceRestored.id, "fork gets a distinct ephemeral id (not aliased to alice)");
+    assert(fork.session_id !== "alice-sess-001", "fork gets a suffixed session_id (not the original)");
+    assert(fork.session_id.startsWith("alice-sess-001"), "fork session_id is suffixed from the original");
+
+    // Alice's original row should still be intact and resolvable.
+    const peers = await fetchJson<PeerEntry[]>("/list-peers", {
+      scope: "machine",
+      cwd: "/test",
+      git_root: null,
+    });
+    const aliceStillThere = peers.find((p) => p.session_id === "alice-sess-001");
+    assert(!!aliceStillThere, "alice's original row is intact (fork did not overwrite it)");
+    assert(aliceStillThere?.id === aliceRestored.id, "alice's ephemeral id unchanged after fork");
+
+    // session:alice-sess-001 should still route to alice, not the fork.
+    const sendRes = await fetchJson<{ ok: boolean; error?: string }>("/send-message", {
+      from_id: bob1.id,
+      to_id: "session:alice-sess-001",
+      text: "routes-to-alice-not-fork",
+    });
+    assert(sendRes.ok === true, "send to session:alice-sess-001 succeeds (routes to original, not fork)");
+  }
+  console.log();
+
   console.log("---");
   console.log(`Result: ${passed} passed, ${failed} failed`);
   process.exitCode = failed > 0 ? 1 : 0;
