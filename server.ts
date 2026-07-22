@@ -26,7 +26,7 @@ import type {
   RegisterResponse,
   PollMessagesResponse,
 } from "./shared/types.ts";
-import { computeSessionId } from "./shared/session.ts";
+import { getOrCreateSessionId } from "./shared/session.ts";
 import {
   generateSummary,
   getGitBranch,
@@ -569,11 +569,12 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker. session_id is derived deterministically from
-  // (pid, cwd, tty) so a re-register after MCP subprocess restart reuses
-  // the same ephemeral id — cached to_id values held by other peers stay
-  // valid across our disconnect/resume.
-  const sessionId = computeSessionId(process.pid, myCwd, tty);
+  // 4. Register with broker. session_id is a UUID persisted to
+  // .claude-peers/session-<tty> in the CWD, so it survives OS-level
+  // restarts (WSL crash, host reboot) where the PID changes. A re-register
+  // with the same session_id reuses the same ephemeral id — cached to_id
+  // values held by other peers stay valid across any reconnect.
+  const sessionId = getOrCreateSessionId(myCwd, tty);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,

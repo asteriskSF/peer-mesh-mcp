@@ -24,7 +24,10 @@ import type {
   PeerStatus,
   Message,
 } from "./shared/types.ts";
-import { computeSessionId } from "./shared/session.ts";
+// No shared import needed — the broker's fallback session_id derivation
+// is a simple hash (see deriveFallbackSessionId below). Modern MCP
+// servers send a persisted UUID session_id; this fallback only serves
+// old clients that don't.
 
 const PORT = parseInt(process.env.CLAUDE_PEERS_PORT ?? "7899", 10);
 const DB_PATH = process.env.CLAUDE_PEERS_DB ?? `${process.env.HOME}/.claude-peers.db`;
@@ -312,11 +315,21 @@ function generateId(): string {
   return id;
 }
 
+// Fallback session_id for old MCP server clients that don't send a
+// persisted session_id. Derives from (pid, cwd, tty) — does NOT survive
+// PID changes (OS restart), but provides reuse for same-PID reconnects.
+// Modern clients send a UUID persisted to .claude-peers/session-<tty>.
+function deriveFallbackSessionId(pid: number, cwd: string, tty: string | null): string {
+  const key = `${pid}\x1f${cwd}\x1f${tty ?? ""}`;
+  const h = BigInt.asUintN(64, BigInt(Bun.hash(key)));
+  return h.toString(16).padStart(16, "0").slice(8);
+}
+
 function handleRegister(body: RegisterRequest): RegisterResponse {
   const session_id =
     body.session_id && body.session_id.length > 0
       ? body.session_id
-      : computeSessionId(body.pid, body.cwd, body.tty);
+      : deriveFallbackSessionId(body.pid, body.cwd, body.tty);
   const now = new Date().toISOString();
 
   // The lookup+write must be atomic: two concurrent /register calls for

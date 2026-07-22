@@ -90,18 +90,25 @@ The broker auto-launches when the first session starts. It reaps peers whose hea
 
 Each peer has two identifiers:
 
-- **`id`** — an 8-char ephemeral transport handle (e.g. `ab12cd34`). Minted on first registration, then **reused across reconnects** for the same logical session. Other peers can cache it and it stays valid after the target's MCP subprocess restarts (disconnect/resume, bridge reload, crash-restart).
-- **`session_id`** — a stable identity for the logical session. By default, an 8-hex-char value derived deterministically from `(pid, cwd, tty)` (the MCP server computes it on registration). The broker also accepts a client-provided `session_id` of any non-empty string format. Survives *both* subprocess restart and broker restart (the broker recomputes it from the registration request, no DB persistence needed to recover it). Two concurrent sessions in the same CWD get distinct `session_id`s because `tty` is part of the key.
+- **`id`** — an 8-char ephemeral transport handle (e.g. `ab12cd34`). Minted on first registration, then **reused across reconnects** for the same logical session. Other peers can cache it and it stays valid after the target reconnects.
+- **`session_id`** — a stable UUID identity for the logical session, persisted to `.claude-peers/session-<tty>` in the session's working directory. The MCP server generates it on first run and reads it back on every subsequent startup, so it survives **OS-level restarts** (WSL crash, host reboot, terminal kill) where the PID changes — not just MCP subprocess restarts. The broker also accepts a client-provided `session_id` of any non-empty string format. Two concurrent sessions in the same CWD get distinct `session_id`s because the TTY is part of the token filename.
 
 `list_peers` shows both. `send_message`'s `to_id` accepts either form:
 
 ```
 send_message(to_id="ab12cd34", ...)              # ephemeral id (direct)
-send_message(to_id="session:1a2b3c4d", ...)      # stable session handle (resolved)
+send_message(to_id="session:<uuid>", ...)        # stable session handle (resolved)
 ```
 
 Use the `session:` form when you want an address that outlives a peer's reconnects — for example, a long-running orchestrator that addresses a worker peer by its session identity rather than a transport id it saw once. The broker resolves `session:<sid>` to whatever ephemeral `id` is currently registered under that `session_id`.
-**Edge case — pid reuse:** if the OS recycles a pid for a new logical session, the new session gets its own `session_id` and ephemeral `id`; the old session's `session:<sid>` handle correctly stops resolving (rather than silently routing to the new session).
+
+**What survives what:**
+
+| Scenario | `id` reused? | `session_id` stable? | Summary kept? | Queued messages kept? |
+|----------|-------------|---------------------|---------------|----------------------|
+| MCP subprocess restart (same PID) | ✅ | ✅ | ✅ | ✅ |
+| WSL crash / host reboot (new PID) | ✅ | ✅ (token file on disk) | ✅ if within reap TTL (default 10 min) | ✅ if within reap TTL |
+| Abandoned session (never resumes) | ❌ (reaped) | ❌ (row deleted) | ❌ (reaped) | ❌ (reaped) |
 
 **Trust model:** `session_id` (and the ephemeral `id`) are **not authenticated**. The inputs `(pid, cwd, tty)` are self-reported by each MCP server with no verification, and the broker trusts them. Under the repo's localhost-only trust model this is acceptable — any local process can claim any peer identity — but do not treat `session_id` as a cryptographically secure handle or rely on it for isolation between mutually-distrusting local processes.
 

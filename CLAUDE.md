@@ -18,7 +18,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 
 ## Session identity
 
-Each peer has an ephemeral 8-char transport `id` (reused across reconnects for the same logical session) and a stable `session_id` (8-hex-char by default, derived from `(pid, cwd, tty)`; the broker also accepts a client-provided `session_id` of any non-empty format). `send_message` accepts `to_id` as either the ephemeral id or `session:<session_id>`. See README "Session identity and addressing".
+Each peer has an ephemeral 8-char transport `id` (reused across reconnects for the same logical session) and a stable `session_id` — a UUID persisted to `.claude-peers/session-<tty>` in the CWD (survives OS-level restarts where the PID changes, not just subprocess restarts). The broker also accepts a client-provided `session_id` of any non-empty format. `send_message` accepts `to_id` as either the ephemeral id or `session:<session_id>`. See README "Session identity and addressing".
 
 ## Peer liveness and status
 
