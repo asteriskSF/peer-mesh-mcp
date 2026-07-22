@@ -45,6 +45,8 @@ switch (cmd) {
         const peers = await brokerFetch<
           Array<{
             id: string;
+            session_id: string;
+            status: "connected" | "disconnected";
             pid: number;
             cwd: string;
             git_root: string | null;
@@ -60,7 +62,7 @@ switch (cmd) {
 
         console.log("\nPeers:");
         for (const p of peers) {
-          console.log(`  ${p.id}  PID:${p.pid}  ${p.cwd}`);
+          console.log(`  ${p.id}  session:${p.session_id}  [${p.status}]  PID:${p.pid}  ${p.cwd}`);
           if (p.summary) console.log(`         ${p.summary}`);
           if (p.tty) console.log(`         TTY: ${p.tty}`);
           console.log(`         Last seen: ${p.last_seen}`);
@@ -77,6 +79,8 @@ switch (cmd) {
       const peers = await brokerFetch<
         Array<{
           id: string;
+          session_id: string;
+          status: "connected" | "disconnected";
           pid: number;
           cwd: string;
           git_root: string | null;
@@ -94,7 +98,7 @@ switch (cmd) {
         console.log("No peers registered.");
       } else {
         for (const p of peers) {
-          const parts = [`${p.id}  PID:${p.pid}  ${p.cwd}`];
+          const parts = [`${p.id}  session:${p.session_id}  [${p.status}]  PID:${p.pid}  ${p.cwd}`];
           if (p.summary) parts.push(`  Summary: ${p.summary}`);
           console.log(parts.join("\n"));
         }
@@ -109,7 +113,7 @@ switch (cmd) {
     const toId = process.argv[3];
     const msg = process.argv.slice(4).join(" ");
     if (!toId || !msg) {
-      console.error("Usage: bun cli.ts send <peer-id> <message>");
+      console.error("Usage: bun cli.ts send <peer-id | session:<session_id>> <message>");
       process.exit(1);
     }
     try {
@@ -156,6 +160,6 @@ switch (cmd) {
 Usage:
   bun cli.ts status          Show broker status and all peers
   bun cli.ts peers           List all peers
-  bun cli.ts send <id> <msg> Send a message to a peer
+  bun cli.ts send <id|session:<sid>> <msg> Send a message to a peer
   bun cli.ts kill-broker     Stop the broker daemon`);
 }

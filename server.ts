@@ -21,11 +21,12 @@ import {
 } from "@modelcontextprotocol/sdk/types.js";
 import type {
   PeerId,
+  SessionId,
   Peer,
   RegisterResponse,
   PollMessagesResponse,
-  Message,
 } from "./shared/types.ts";
+import { getOrCreateSessionId } from "./shared/session.ts";
 import {
   generateSummary,
   getGitBranch,
@@ -136,6 +137,7 @@ function getTty(): string | null {
 // --- State ---
 
 let myId: PeerId | null = null;
+let mySessionId: SessionId | null = null;
 let myCwd = process.cwd();
 let myGitRoot: string | null = null;
 
@@ -152,11 +154,11 @@ const mcp = new Server(
 
 IMPORTANT: When you receive a <channel source="claude-peers" ...> message, RESPOND IMMEDIATELY. Do not wait until your current task is finished. Pause what you are doing, reply to the message using send_message, then resume your work. Treat incoming peer messages like a coworker tapping you on the shoulder — answer right away, even if you're in the middle of something.
 
-Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. Reply by calling send_message with their from_id.
+Read the from_id, from_summary, and from_cwd attributes to understand who sent the message. To reply, call send_message and pass their from_id value as the to_id argument (the parameter is named "to_id" — NOT "to" or "from_id").
 
 Available tools:
 - list_peers: Discover other Claude Code instances (scope: machine/directory/repo)
-- send_message: Send a message to another instance by ID
+- send_message: Send a message to another instance — pass the target's peer ID as the to_id argument (NOT to or from_id)
 - set_summary: Set a 1-2 sentence summary of what you're working on (visible to other peers)
 - check_messages: Manually check for new messages
 
@@ -187,13 +189,13 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance. Pass the target's peer ID as `to_id` — the parameter name is `to_id` (NOT `to` or `target_id`). Also accepts the stable addressing form `session:<session_id>`, which survives the target's subprocess restart. The message will be pushed into their session immediately via channel notification.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers)",
+          description: "The peer ID of the target (from list_peers), or `session:<session_id>` for stable addressing across reconnects. Parameter name is `to_id` — do not use `to` or `target_id`.",
         },
         message: {
           type: "string" as const,
@@ -263,6 +265,8 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         const lines = peers.map((p) => {
           const parts = [
             `ID: ${p.id}`,
+            `Session: ${p.session_id}`,
+            `Status: ${p.status}`,
             `PID: ${p.pid}`,
             `CWD: ${p.cwd}`,
           ];
@@ -295,7 +299,30 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
     }
 
     case "send_message": {
-      const { to_id, message } = args as { to_id: string; message: string };
+      // Accept legacy param names (`to`, `from_id`, `text`) and normalize.
+      // Forked/long-lived sessions can carry stale parameter names in their
+      // working context; rather than silently failing with "Peer undefined
+      // not found", we normalize and tell the caller their input was legacy
+      // so they can update their mental model.
+      const a = args as Record<string, unknown>;
+      const to_id = (a.to_id ?? a.to ?? a.target_id) as string | undefined;
+      const message = (a.message ?? a.text) as string | undefined;
+      const legacyKeys: string[] = [];
+      if (a.to_id === undefined && a.to !== undefined) legacyKeys.push("to (use to_id)");
+      if (a.to_id === undefined && a.target_id !== undefined) legacyKeys.push("target_id (use to_id)");
+      if (a.message === undefined && a.text !== undefined) legacyKeys.push("text (use message)");
+      if (!to_id || !message) {
+        return {
+          content: [{
+            type: "text" as const,
+            text: `send_message requires to_id (target peer ID or session:<session_id>, NOT \"to\" or \"target_id\") and message. Got keys: ${Object.keys(a).join(", ") || "(none)"}.`,
+          }],
+          isError: true,
+        };
+      }
+      if (legacyKeys.length > 0) {
+        log(`send_message: accepted legacy param(s): ${legacyKeys.join(", ")}`);
+      }
       if (!myId) {
         return {
           content: [{ type: "text" as const, text: "Not registered with broker yet" }],
@@ -314,8 +341,11 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
             isError: true,
           };
         }
+        const legacyNote = legacyKeys.length > 0
+          ? ` (note: you used legacy parameter ${legacyKeys.join(", ")} — update to to_id/message going forward)`
+          : "";
         return {
-          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}` }],
+          content: [{ type: "text" as const, text: `Message sent to peer ${to_id}${legacyNote}` }],
         };
       } catch (e) {
         return {
@@ -364,11 +394,27 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         };
       }
       try {
-        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+        const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+          id: myId,
+          ack_supported: true,
+        });
         if (result.messages.length === 0) {
           return {
             content: [{ type: "text" as const, text: "No new messages." }],
           };
+        }
+        // Ack immediately — the LLM definitionally receives these messages
+        // in the tool response, so we can mark them delivered without
+        // waiting for further confirmation. Failure is non-critical: an
+        // unacked message simply gets re-returned on the next call.
+        try {
+          await brokerFetch("/ack-messages", {
+            id: myId,
+            message_ids: result.messages.map((m) => m.id),
+          });
+        } catch {
+          // Best-effort; messages will be redelivered on next poll if ack
+          // never reaches the broker (at-least-once semantics).
         }
         const lines = result.messages.map(
           (m) => `From ${m.from_id} (${m.sent_at}):\n${m.text}`
@@ -405,7 +451,18 @@ async function pollAndPushMessages() {
   if (!myId) return;
 
   try {
-    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", { id: myId });
+    // ack_supported=true opts into the broker's new at-least-once delivery
+    // semantics: messages stay un-acked until we successfully push them
+    // and call /ack-messages. See broker.ts handlePollMessages.
+    const result = await brokerFetch<PollMessagesResponse>("/poll-messages", {
+      id: myId,
+      ack_supported: true,
+    });
+
+    // Track messages we successfully pushed. Only these get acked; messages
+    // whose push throws stay delivered=0 in the broker and will be retried
+    // on the next poll cycle after the broker's POLL_LEASE_SECONDS expires.
+    const acked: number[] = [];
 
     for (const msg of result.messages) {
       // Look up the sender's info for context
@@ -426,21 +483,46 @@ async function pollAndPushMessages() {
         // Non-critical, proceed without sender info
       }
 
-      // Push as channel notification — this is what makes it immediate
-      await mcp.notification({
-        method: "notifications/claude/channel",
-        params: {
-          content: msg.text,
-          meta: {
-            from_id: msg.from_id,
-            from_summary: fromSummary,
-            from_cwd: fromCwd,
-            sent_at: msg.sent_at,
+      try {
+        // Push as channel notification — this is what makes it immediate
+        await mcp.notification({
+          method: "notifications/claude/channel",
+          params: {
+            content: msg.text,
+            meta: {
+              from_id: msg.from_id,
+              from_summary: fromSummary,
+              from_cwd: fromCwd,
+              sent_at: msg.sent_at,
+            },
           },
-        },
-      });
+        });
+        acked.push(msg.id);
+        log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+      } catch (pushErr) {
+        log(
+          `Push failed for msg ${msg.id} (will retry after lease expires): ${
+            pushErr instanceof Error ? pushErr.message : String(pushErr)
+          }`,
+        );
+        // Don't ack — broker will return this message again on a future poll
+        // once polled_at is older than POLL_LEASE_SECONDS.
+      }
+    }
 
-      log(`Pushed message from ${msg.from_id}: ${msg.text.slice(0, 80)}`);
+    // Ack only what we successfully pushed. Ack failure is non-critical (the
+    // worst case is one redelivery to the LLM, which is acceptable under
+    // at-least-once semantics).
+    if (acked.length > 0) {
+      try {
+        await brokerFetch("/ack-messages", { id: myId, message_ids: acked });
+      } catch (ackErr) {
+        log(
+          `Ack failed for ${acked.length} message(s), may redeliver: ${
+            ackErr instanceof Error ? ackErr.message : String(ackErr)
+          }`,
+        );
+      }
     }
   } catch (e) {
     // Broker might be down temporarily, don't crash
@@ -487,16 +569,26 @@ async function main() {
   // Wait briefly for summary, but don't block startup
   await Promise.race([summaryPromise, new Promise((r) => setTimeout(r, 3000))]);
 
-  // 4. Register with broker
+  // 4. Register with broker. session_id is a UUID persisted to
+  // .claude-peers/session-<tty> in the CWD, so it survives OS-level
+  // restarts (WSL crash, host reboot) where the PID changes. A re-register
+  // with the same session_id reuses the same ephemeral id — cached to_id
+  // values held by other peers stay valid across any reconnect.
+  // session_id is a UUID v4 validated by getOrCreateSessionId before
+  // return — file-sourced data is sanitized (uuid regex match) before
+  // flowing into this network request.
+  const sessionId = getOrCreateSessionId(myCwd, tty);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,
     cwd: myCwd,
     git_root: myGitRoot,
     tty,
     summary: initialSummary,
+    session_id: sessionId,
   });
   myId = reg.id;
-  log(`Registered as peer ${myId}`);
+  mySessionId = reg.session_id;
+  log(`Registered as peer ${myId} (session ${mySessionId})`);
 
   // If summary generation is still running, update it when done
   if (!initialSummary) {

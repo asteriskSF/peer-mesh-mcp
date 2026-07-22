@@ -16,6 +16,14 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
 - `cli.ts` — CLI utility for inspecting broker state.
 
+## Session identity
+
+Each peer has an ephemeral 8-char transport `id` (reused across reconnects for the same logical session) and a stable `session_id` — a UUID persisted to `.claude-peers/session-<tty>` in the CWD (survives OS-level restarts where the PID changes, not just subprocess restarts). The broker also accepts a client-provided `session_id` of any non-empty format. `send_message` accepts `to_id` as either the ephemeral id or `session:<session_id>`. See README "Session identity and addressing".
+
+## Peer liveness and status
+
+Roster presence is time-based, not PID-based. Each MCP server heartbeats every 15s; the broker derives `status: "connected" | "disconnected"` from `last_seen` recency and reaps rows (with their undelivered messages) only once `last_seen` is older than `CLAUDE_PEERS_REAP_TTL_SECONDS` (default 600s). A peer whose subprocess is momentarily down stays in the roster as `disconnected` and keeps its queued messages, delivering them on resume. TTLs tunable via `CLAUDE_PEERS_CONNECTED_WINDOW_SECONDS` (default 45) and `CLAUDE_PEERS_REAP_TTL_SECONDS`. See README "Peer liveness and status".
+
 ## Running
 
 ```bash
@@ -28,7 +36,7 @@ claude --dangerously-load-development-channels server:claude-peers
 # CLI:
 bun cli.ts status
 bun cli.ts peers
-bun cli.ts send <peer-id> <message>
+bun cli.ts send <peer-id | session:<session_id>> <message>
 bun cli.ts kill-broker
 ```
 
