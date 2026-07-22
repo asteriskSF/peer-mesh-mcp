@@ -15,4 +15,5 @@ jobs:
       - run: |
           bun test/test-ack-delivery.ts
           bun test/test-session-id.ts
+          bun test/test-session-token.ts
           bun test/test-peer-status.ts
