@@ -574,6 +574,9 @@ async function main() {
   // restarts (WSL crash, host reboot) where the PID changes. A re-register
   // with the same session_id reuses the same ephemeral id — cached to_id
   // values held by other peers stay valid across any reconnect.
+  // session_id is a UUID v4 validated by getOrCreateSessionId before
+  // return — file-sourced data is sanitized (uuid regex match) before
+  // flowing into this network request.
   const sessionId = getOrCreateSessionId(myCwd, tty);
   const reg = await brokerFetch<RegisterResponse>("/register", {
     pid: process.pid,

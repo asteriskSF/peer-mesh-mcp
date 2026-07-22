@@ -7,7 +7,7 @@
 // crash, host reboot, terminal kill) where the PID changes. The file is
 // created on first run and read on every subsequent startup.
 
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 /**
@@ -46,12 +46,19 @@ export function getOrCreateSessionId(cwd: string, tty: string | null): string {
   const dir = join(cwd, SESSION_DIR);
   const tokenFile = join(dir, `session-${ttyToFilePart(tty)}`);
 
-  if (existsSync(tokenFile)) {
+  // Read the token file directly (no existsSync check) to avoid a
+  // TOCTOU race between the existence check and the read. If the file
+  // doesn't exist or is empty/corrupted, fall through to create it.
+  try {
     const token = readFileSync(tokenFile, "utf-8").trim();
-    if (token) return token;
+    if (token && isValidSessionToken(token)) return token;
+  } catch {
+    // File doesn't exist or unreadable — fall through to create.
   }
 
-  // First run (or corrupted/empty file): generate a fresh UUID and persist it.
+  // First run (or corrupted/empty file): generate a fresh UUID and
+  // persist it. Use writeFile (not existsSync + writeFileSync) to avoid
+  // the same TOCTOU class. If the directory doesn't exist, create it first.
   const sessionId = crypto.randomUUID();
   try {
     mkdirSync(dir, { recursive: true });
@@ -62,4 +69,11 @@ export function getOrCreateSessionId(cwd: string, tty: string | null): string {
     // for the current run. The broker still accepts it.
   }
   return sessionId;
+}
+
+// Validate that a persisted token is a well-formed UUID v4. Prevents
+// corrupted or tampered token files from injecting arbitrary data into
+// the broker registration payload.
+function isValidSessionToken(token: string): boolean {
+  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(token);
 }
