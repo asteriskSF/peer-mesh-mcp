@@ -189,13 +189,13 @@ const TOOLS = [
   {
     name: "send_message",
     description:
-      "Send a message to another Claude Code instance by peer ID. Pass the target's peer ID as `to_id` — the parameter name is `to_id` (NOT `to` or `from_id`). The message will be pushed into their session immediately via channel notification.",
+      "Send a message to another Claude Code instance. Pass the target's peer ID as `to_id` — the parameter name is `to_id` (NOT `to` or `target_id`). Also accepts the stable addressing form `session:<session_id>`, which survives the target's subprocess restart. The message will be pushed into their session immediately via channel notification.",
     inputSchema: {
       type: "object" as const,
       properties: {
         to_id: {
           type: "string" as const,
-          description: "The peer ID of the target Claude Code instance (from list_peers). Parameter name is `to_id` — do not use `to` or `from_id`.",
+          description: "The peer ID of the target (from list_peers), or `session:<session_id>` for stable addressing across reconnects. Parameter name is `to_id` — do not use `to` or `target_id`.",
         },
         message: {
           type: "string" as const,
@@ -315,7 +315,7 @@ mcp.setRequestHandler(CallToolRequestSchema, async (req) => {
         return {
           content: [{
             type: "text" as const,
-            text: `send_message requires to_id (target peer ID, NOT \"to\" or \"from_id\") and message. Got keys: ${Object.keys(a).join(", ") || "(none)"}.`,
+            text: `send_message requires to_id (target peer ID or session:<session_id>, NOT \"to\" or \"target_id\") and message. Got keys: ${Object.keys(a).join(", ") || "(none)"}.`,
           }],
           isError: true,
         };

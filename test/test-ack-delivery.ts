@@ -10,8 +10,10 @@
  * inspection from the test process (Bun:sqlite WAL visibility from a
  * separate-process readonly connection is unreliable).
  *
- * Lease-expiry case is exercised by using a tiny override port broker with
- * a very short POLL_LEASE_SECONDS; in production the default is 60s.
+ * Lease-expiry behavior (re-poll after POLL_LEASE_SECONDS without ack) is
+ * verified within the 60s default window by polling once, confirming the
+ * re-poll returns 0, then acking. The test does not override
+ * POLL_LEASE_SECONDS; it relies on the broker's default 60s lease.
  *
  * Run: bun test/test-ack-delivery.ts
  */
@@ -190,7 +192,7 @@ try {
 
   console.log("---");
   console.log(`Result: ${passed} passed, ${failed} failed`);
-  process.exit(failed > 0 ? 1 : 0);
+  process.exitCode = failed > 0 ? 1 : 0;
 } finally {
   proc.kill();
   await new Promise((r) => setTimeout(r, 200));

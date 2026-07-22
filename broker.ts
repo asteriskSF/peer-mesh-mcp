@@ -256,9 +256,13 @@ const updateSummary = db.prepare(`
   UPDATE peers SET summary = ? WHERE id = ?
 `);
 
-const deletePeer = db.prepare(`
-  DELETE FROM peers WHERE id = ?
-`);
+// Delete a peer row AND its undelivered messages in one transaction.
+// Prevents orphaned delivered=0 messages that would never be polled and
+// could bloat the DB. Delivered messages are retained as historical record.
+const deletePeerWithMessages = db.transaction((id: string) => {
+  db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
+  db.run("DELETE FROM peers WHERE id = ?", [id]);
+});
 
 const selectAllPeers = db.prepare(`
   SELECT * FROM peers
@@ -348,7 +352,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
         .query("SELECT id FROM peers WHERE pid = ? AND session_id != ?")
         .all(body.pid, session_id) as { id: string }[];
       for (const row of staleByPid) {
-        deletePeer.run(row.id);
+        deletePeerWithMessages(row.id);
       }
       return { id: existingBySession.id, session_id };
     }
@@ -363,7 +367,7 @@ function handleRegister(body: RegisterRequest): RegisterResponse {
       | { id: string }
       | null;
     if (existingByPid) {
-      deletePeer.run(existingByPid.id);
+      deletePeerWithMessages(existingByPid.id);
     }
 
     const id = generateId();
@@ -513,7 +517,7 @@ function handleAckMessages(body: AckMessagesRequest): { ok: boolean } {
 }
 
 function handleUnregister(body: { id: string }): void {
-  deletePeer.run(body.id);
+  deletePeerWithMessages(body.id);
 }
 
 // --- HTTP Server ---

@@ -81,10 +81,10 @@ interface PollResp {
   messages: Array<{ id: number; from_id: string; to_id: string; text: string; sent_at: string }>;
 }
 
-// The broker's handleListPeers prunes any peer whose pid isn't a live
-// process (process.kill(pid, 0) check). Use real long-lived child PIDs
-// instead of fake numbers so roster + re-register paths exercise the
-// same code production runs.
+// Real long-lived child PIDs so the broker's process-kill liveness check
+// (used in cleanStalePeers on older versions) doesn't prune our test peers.
+// The current broker uses time-based reaping, but real PIDs keep the test
+// faithful to production and let us verify pid-reuse behavior in test 7.
 const dummies: Bun.Subprocess<"ignore", "ignore", "inherit">[] = [];
 function spawnDummy(): number {
   const d = Bun.spawn(["sleep", "300"], { stdio: ["ignore", "ignore", "inherit"] });
@@ -94,7 +94,6 @@ function spawnDummy(): number {
 
 const alicePid = spawnDummy();
 const bobPid = spawnDummy();
-const carolPid = spawnDummy();
 
 const brokerScript = new URL("../broker.ts", import.meta.url).pathname;
 const proc = Bun.spawn(["bun", brokerScript], {
@@ -259,7 +258,7 @@ try {
 
   console.log("---");
   console.log(`Result: ${passed} passed, ${failed} failed`);
-  process.exit(failed > 0 ? 1 : 0);
+  process.exitCode = failed > 0 ? 1 : 0;
 } finally {
   proc.kill();
   for (const d of dummies) {

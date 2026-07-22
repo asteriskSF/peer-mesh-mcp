@@ -91,7 +91,7 @@ The broker auto-launches when the first session starts. It reaps peers whose hea
 Each peer has two identifiers:
 
 - **`id`** — an 8-char ephemeral transport handle (e.g. `ab12cd34`). Minted on first registration, then **reused across reconnects** for the same logical session. Other peers can cache it and it stays valid after the target's MCP subprocess restarts (disconnect/resume, bridge reload, crash-restart).
-- **`session_id`** — an 8-hex-char stable identity derived deterministically from `(pid, cwd, tty)`. Survives *both* subprocess restart and broker restart (the broker recomputes it from the registration request, no DB persistence needed to recover it). Two concurrent sessions in the same CWD get distinct `session_id`s because `tty` is part of the key.
+- **`session_id`** — a stable identity for the logical session. By default, an 8-hex-char value derived deterministically from `(pid, cwd, tty)` (the MCP server computes it on registration). The broker also accepts a client-provided `session_id` of any non-empty string format. Survives *both* subprocess restart and broker restart (the broker recomputes it from the registration request, no DB persistence needed to recover it). Two concurrent sessions in the same CWD get distinct `session_id`s because `tty` is part of the key.
 
 `list_peers` shows both. `send_message`'s `to_id` accepts either form:
 
