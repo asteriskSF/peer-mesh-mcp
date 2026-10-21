@@ -11,6 +11,7 @@ Peer discovery and messaging MCP channel for Claude Code instances.
 ## Architecture
 
 - `broker.ts` — Singleton HTTP daemon on localhost:7899 + SQLite. Auto-launched by the MCP server.
+- `broker-db.ts` — Broker DB open, schema and migrations, poll SQL, delivered-message prune.
 - `server.ts` — MCP stdio server, one per Claude Code instance. Connects to broker, exposes tools, pushes channel notifications.
 - `shared/types.ts` — Shared TypeScript types for broker API.
 - `shared/summarize.ts` — Auto-summary generation via gpt-5.4-nano.
@@ -23,6 +24,10 @@ Each peer has an ephemeral 8-char transport `id` (reused across reconnects for t
 ## Peer liveness and status
 
 Roster presence is time-based, not PID-based. Each MCP server heartbeats every 15s; the broker derives `status: "connected" | "disconnected"` from `last_seen` recency and reaps rows (with their undelivered messages) only once `last_seen` is older than `CLAUDE_PEERS_REAP_TTL_SECONDS` (default 600s). A peer whose subprocess is momentarily down stays in the roster as `disconnected` and keeps its queued messages, delivering them on resume. TTLs tunable via `CLAUDE_PEERS_CONNECTED_WINDOW_SECONDS` (default 45) and `CLAUDE_PEERS_REAP_TTL_SECONDS`. See README "Peer liveness and status".
+
+## Message retention
+
+Undelivered messages are never pruned by age (only with a reaped or unregistered recipient). Delivered messages are deleted once `sent_at` is older than `CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS` (default 7 days), on the reaper timer. The poll query relies on the partial index `idx_messages_pending`, so keep `delivered = 0` a literal in any query meant to use it. Schema and message SQL live in `broker-db.ts`. See README "Message retention".
 
 ## Running
 
