@@ -17,3 +17,4 @@ jobs:
           bun test/test-session-id.ts
           bun test/test-session-token.ts
           bun test/test-peer-status.ts
+          bun test/test-message-retention.ts

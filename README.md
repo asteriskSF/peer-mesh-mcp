@@ -122,6 +122,10 @@ Each MCP server heartbeats the broker every 15s. The broker derives a peer's `st
 
 `list_peers` shows `Status:` on every entry. This decouples roster presence from subprocess PID liveness: a session is considered alive as long as it's heartbeating (or recently was), not as long as one specific OS process is running. It also fixes a latent bug where PID reuse by an unrelated local process could make a dead peer look "alive" forever.
 
+## Message retention
+
+Retention never applies to undelivered messages: they are removed only when their recipient is reaped or unregisters. Once a message is delivered (acked), it is deleted after `CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS` (default 7 days, measured from when it was sent) by the same periodic timer that reaps peers. Nothing reads delivered messages back, so the broker keeps no long-term message history.
+
 ## Auto-summary
 
 If you set `OPENAI_API_KEY` in your environment, each instance generates a brief summary on startup using `gpt-5.4-nano` (costs fractions of a cent). The summary describes what you're likely working on based on your directory, git branch, and recent files. Other instances see this when they call `list_peers`.
@@ -149,6 +153,7 @@ bun cli.ts kill-broker       # stop the broker
 | `CLAUDE_PEERS_DB`                          | `~/.claude-peers.db` | SQLite database path                  |
 | `CLAUDE_PEERS_CONNECTED_WINDOW_SECONDS`    | `45`                 | Peer is `connected` if last heartbeat within this many seconds |
 | `CLAUDE_PEERS_REAP_TTL_SECONDS`            | `600`                | Peer row + queued messages reaped once last heartbeat is older than this |
+| `CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS`   | `604800` (7 days)    | Delivered messages deleted once sent longer ago than this |
 | `OPENAI_API_KEY`                           | —                    | Enables auto-summary via gpt-5.4-nano |
 
 ## Requirements

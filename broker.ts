@@ -9,7 +9,6 @@
  * Run directly: bun broker.ts
  */
 
-import { Database } from "bun:sqlite";
 import type {
   RegisterRequest,
   RegisterResponse,
@@ -24,6 +23,12 @@ import type {
   PeerStatus,
   Message,
 } from "./shared/types.ts";
+import {
+  openBrokerDb,
+  pruneDeliveredMessages,
+  SELECT_POLLABLE_SQL,
+  SELECT_UNDELIVERED_SQL,
+} from "./broker-db.ts";
 // No shared import needed — the broker's fallback session_id derivation
 // is a simple hash (see deriveFallbackSessionId below). Modern MCP
 // servers send a persisted UUID session_id; this fallback only serves
@@ -90,75 +95,17 @@ if (CONNECTED_WINDOW_SECONDS >= REAP_TTL_SECONDS) {
   );
 }
 
+// Delivered messages are deleted once sent_at is older than this. The broker
+// never reads delivered rows, and keeping them grew the table without bound.
+// Default 7 days; tune via env.
+const MESSAGE_RETENTION_SECONDS = positiveIntEnv(
+  "CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS",
+  7 * 24 * 3600,
+);
+
 // --- Database setup ---
 
-const db = new Database(DB_PATH);
-db.run("PRAGMA journal_mode = WAL");
-db.run("PRAGMA busy_timeout = 3000");
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS peers (
-    id TEXT PRIMARY KEY,
-    pid INTEGER NOT NULL,
-    cwd TEXT NOT NULL,
-    git_root TEXT,
-    tty TEXT,
-    summary TEXT NOT NULL DEFAULT '',
-    registered_at TEXT NOT NULL,
-    last_seen TEXT NOT NULL
-  )
-`);
-
-db.run(`
-  CREATE TABLE IF NOT EXISTS messages (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    from_id TEXT NOT NULL,
-    to_id TEXT NOT NULL,
-    text TEXT NOT NULL,
-    sent_at TEXT NOT NULL,
-    delivered INTEGER NOT NULL DEFAULT 0,
-    FOREIGN KEY (from_id) REFERENCES peers(id),
-    FOREIGN KEY (to_id) REFERENCES peers(id)
-  )
-`);
-
-// Idempotent migration: add polled_at column if missing. Tracks when a
-// message was last returned to a polling MCP server, so we can retry
-// after POLL_LEASE_SECONDS if the LLM ack never arrived. Pre-migration
-// behavior of marking delivered=1 on poll caused silent message loss
-// when channel-notification pushes failed.
-{
-  const columns = (db.query("PRAGMA table_info(messages)").all() as { name: string }[]).map(
-    (c) => c.name,
-  );
-  if (!columns.includes("polled_at")) {
-    db.run("ALTER TABLE messages ADD COLUMN polled_at TEXT");
-    console.error("[claude-peers broker] migration: added polled_at column to messages");
-  }
-}
-
-// Idempotent migration: add session_id column if missing. Stable
-// per-session identity keyed on (pid, cwd, tty), so the same logical
-// session keeps the same session_id across MCP subprocess restarts
-// and broker restarts. handleRegister uses it to reuse the existing
-// peer row's ephemeral `id` on re-registration, fixing the bug where
-// cached `to_id` values became stale after a disconnect/resume.
-{
-  const peerCols = (db.query("PRAGMA table_info(peers)").all() as { name: string }[]).map(
-    (c) => c.name,
-  );
-  if (!peerCols.includes("session_id")) {
-    db.run("ALTER TABLE peers ADD COLUMN session_id TEXT NOT NULL DEFAULT ''");
-    console.error("[claude-peers broker] migration: added session_id column to peers");
-  }
-  // Partial UNIQUE index excluding the empty-string default: pre-migration
-  // rows and any pathological empty session_id get colliding '' values that
-  // must NOT trip the constraint. Real session_ids (always non-empty) get
-  // uniqueness enforced, which is the backstop for the handleRegister race.
-  db.run(
-    "CREATE UNIQUE INDEX IF NOT EXISTS idx_peers_session_id ON peers(session_id) WHERE session_id != ''",
-  );
-}
+const db = openBrokerDb(DB_PATH);
 
 // Derive a peer's liveness status from its last_seen timestamp.
 // "connected" if within CONNECTED_WINDOW_SECONDS, else "disconnected".
@@ -186,7 +133,7 @@ function reapStalePeers() {
   for (const row of stale) {
     db.run("DELETE FROM peers WHERE id = ?", [row.id]);
     // Drop undelivered messages addressed to the reaped peer. Delivered
-    // messages are retained as historical record (same as prior behavior).
+    // messages age out separately, via pruneOldMessages.
     db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [row.id]);
   }
   console.error(
@@ -194,11 +141,29 @@ function reapStalePeers() {
   );
 }
 
+function pruneOldMessages() {
+  const cutoff = new Date(Date.now() - MESSAGE_RETENTION_SECONDS * 1000).toISOString();
+  const pruned = pruneDeliveredMessages(db, cutoff);
+  if (pruned > 0) {
+    console.error(
+      `[claude-peers broker] pruned ${pruned} delivered message(s) (sent_at < ${cutoff})`,
+    );
+  }
+}
+
 reapStalePeers();
 
-// Periodically reap stale peers. Interval is the smaller of 30s or
-// REAP_TTL_SECONDS/2, so reaping stays responsive even with a very short
-setInterval(reapStalePeers, Math.min(30_000, Math.max(1_000, (REAP_TTL_SECONDS * 1000) / 2)));
+// Periodically reap stale peers and prune old delivered messages. Interval
+// is the smaller of 30s or REAP_TTL_SECONDS/2, so reaping stays responsive
+// even with a very short TTL. The prune shares this timer so a short TTL
+// also makes it observable in seconds; it costs one scan of retained rows.
+setInterval(
+  () => {
+    reapStalePeers();
+    pruneOldMessages();
+  },
+  Math.min(30_000, Math.max(1_000, (REAP_TTL_SECONDS * 1000) / 2)),
+);
 
 // Force-deliver messages that have been polled but never acked for too long.
 // Protects against old MCP server clients that don't call /ack-messages —
@@ -269,7 +234,7 @@ const updateSummary = db.prepare(`
 
 // Delete a peer row AND its undelivered messages in one transaction.
 // Prevents orphaned delivered=0 messages that would never be polled and
-// could bloat the DB. Delivered messages are retained as historical record.
+// could bloat the DB. Delivered messages age out via pruneOldMessages.
 const deletePeerWithMessages = db.transaction((id: string) => {
   db.run("DELETE FROM messages WHERE to_id = ? AND delivered = 0", [id]);
   db.run("DELETE FROM peers WHERE id = ?", [id]);
@@ -292,17 +257,9 @@ const insertMessage = db.prepare(`
   VALUES (?, ?, ?, ?, 0)
 `);
 
-const selectUndelivered = db.prepare(`
-  SELECT * FROM messages WHERE to_id = ? AND delivered = 0 ORDER BY sent_at ASC
-`);
+const selectUndelivered = db.prepare(SELECT_UNDELIVERED_SQL);
 
-const selectPollable = db.prepare(`
-  SELECT * FROM messages
-  WHERE to_id = ?
-    AND delivered = 0
-    AND (polled_at IS NULL OR polled_at < ?)
-  ORDER BY sent_at ASC
-`);
+const selectPollable = db.prepare(SELECT_POLLABLE_SQL);
 
 const markPolled = db.prepare(`
   UPDATE messages SET polled_at = ? WHERE id = ?
