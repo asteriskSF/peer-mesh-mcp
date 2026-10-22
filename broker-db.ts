@@ -102,16 +102,27 @@ export const SELECT_POLLABLE_SQL = `
   ORDER BY sent_at ASC
 `;
 
+// DBs whose last TRUNCATE checkpoint was blocked by a reader; the next
+// prune retries even if it deletes nothing.
+const checkpointPending = new WeakSet<Database>();
+
 // Delete delivered messages sent before cutoffIso; undelivered rows are
 // never touched. Returns the number deleted. After a non-empty prune the
-// WAL is checkpointed in TRUNCATE mode, which copies it into the DB and
-// resets the WAL file to zero bytes, so the space the pruned rows took in
-// the WAL is released. If another connection is reading, the checkpoint
-// waits up to busy_timeout and otherwise leaves the WAL for the next prune.
+// WAL is checkpointed in TRUNCATE mode, which resets the WAL file to zero
+// bytes. busy_timeout is 0 for the checkpoint: the broker is single-threaded,
+// so waiting on another connection's read would stall every request.
 export function pruneDeliveredMessages(db: Database, cutoffIso: string): number {
   const result = db.run("DELETE FROM messages WHERE delivered = 1 AND sent_at < ?", [cutoffIso]);
-  if (result.changes > 0) {
-    db.run("PRAGMA wal_checkpoint(TRUNCATE)");
+  if (result.changes > 0 || checkpointPending.has(db)) {
+    const { timeout } = db.query("PRAGMA busy_timeout").get() as { timeout: number };
+    db.run("PRAGMA busy_timeout = 0");
+    try {
+      const { busy } = db.query("PRAGMA wal_checkpoint(TRUNCATE)").get() as { busy: number };
+      if (busy) checkpointPending.add(db);
+      else checkpointPending.delete(db);
+    } finally {
+      db.run(`PRAGMA busy_timeout = ${timeout}`);
+    }
   }
   return result.changes;
 }

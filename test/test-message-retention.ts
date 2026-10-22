@@ -12,8 +12,10 @@
  *      before the cutoff; undelivered rows are kept however old.
  *   4. A prune that deletes rows truncates the WAL; one that deletes
  *      nothing leaves it alone.
+ *   4b. A checkpoint blocked by a concurrent reader returns at once, keeps
+ *      busy_timeout, and is retried by the next prune.
  *   5. A running broker honours CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS on
- *      its periodic timer, and creates the index on an existing DB.
+ *      its periodic timer, reaps silent peers on that same timer, and creates the index on an existing DB.
  *      The default retention is 7 days.
  *   6. An invalid CLAUDE_PEERS_MESSAGE_RETENTION_SECONDS fails broker boot.
  *
@@ -207,6 +209,54 @@ try {
     removeDb(UNIT_DB);
   }
 
+  // --- Test 4b: a reader blocking the checkpoint does not stall the prune ---
+  console.log("[test 4b] checkpoint blocked by a reader returns at once and retries later");
+  {
+    const db = openBrokerDb(UNIT_DB);
+    const old = new Date(Date.now() - 30 * 86400_000).toISOString();
+    const fill = () =>
+      db.transaction(() => {
+        for (let i = 0; i < 200; i++) insertMessage(db, "p", old, 1, "y".repeat(2000));
+      })();
+    fill();
+    const reader = new Database(UNIT_DB, { readonly: true });
+    reader.run("BEGIN");
+    reader.query("SELECT COUNT(*) FROM messages").get();
+
+    // A non-default value, so restoring a hardcoded constant would show.
+    db.run("PRAGMA busy_timeout = 1234");
+    const btBefore = (db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+    const t0 = performance.now();
+    let threw = false;
+    let n = 0;
+    try {
+      n = pruneDeliveredMessages(db, new Date().toISOString());
+    } catch {
+      threw = true;
+    }
+    const ms = performance.now() - t0;
+    assert(!threw, "busy checkpoint does not throw");
+    assert(n === 200, `rows still deleted (got ${n})`);
+    assert(ms < 500, `prune returns without waiting on the reader (${ms.toFixed(1)} ms)`);
+    assert(walSize(UNIT_DB) > 0, "precondition: WAL not truncated while the reader holds it");
+    const bt = (db.query("PRAGMA busy_timeout").get() as { timeout: number }).timeout;
+    assert(btBefore > 0 && bt === btBefore, `busy_timeout unchanged by the prune (${btBefore} -> ${bt})`);
+
+    reader.run("COMMIT");
+    reader.close();
+    const none = pruneDeliveredMessages(db, new Date().toISOString());
+    assert(none === 0, "retry prune deletes nothing");
+    assert(walSize(UNIT_DB) === 0, `retry checkpoints the WAL once the reader is gone (got ${walSize(UNIT_DB)})`);
+
+    // The retry clears the pending state: a later empty prune leaves the WAL alone.
+    insertMessage(db, "p", new Date().toISOString(), 1);
+    const grown = walSize(UNIT_DB);
+    pruneDeliveredMessages(db, old);
+    assert(grown > 0 && walSize(UNIT_DB) === grown, "after a successful retry, an empty prune skips the checkpoint");
+    db.close();
+    removeDb(UNIT_DB);
+  }
+
   // --- Test 5: running broker prunes on its timer, honouring the env var ---
   console.log("[test 5] broker prunes on its timer and creates the index at startup");
   {
@@ -253,9 +303,23 @@ try {
     });
     await fetchJson("/ack-messages", { id: alice!.id, message_ids: polled.messages.map((m) => m.id) });
     assert(polled.messages.length === 1, "message delivered and acked through the broker");
+    const health = async () =>
+      ((await (await fetch(`${BROKER_URL}/health`)).json()) as { peers: number }).peers;
+    assert((await health()) === 2, "both peers registered");
 
-    // Retention 2 s + up to 1.5 s for the next tick.
-    await sleep(5000);
+    // Poll /health, never /list-peers: list-peers reaps on its own, which
+    // would hide a timer that stopped reaping. Reap needs last_seen older
+    // than 3 s plus a tick (period 1.5 s); 10 s bounds that with margin.
+    const t0 = Date.now();
+    let left = await health();
+    while (left !== 0 && Date.now() - t0 < 10_000) {
+      await sleep(250);
+      left = await health();
+    }
+    assert(left === 0, `silent peers reaped by the periodic timer (${left} left after ${Date.now() - t0} ms)`);
+    // Reap (last_seen + 3 s) is later than prune (sent_at + 2 s), and both run
+    // in the same tick, so the prune has also run; one more period for margin.
+    await sleep(1500);
     broker.kill("SIGKILL");
     await broker.exited;
     broker = null;
